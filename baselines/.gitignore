@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.dat
+*.bak
+*.dir
+*.pkl
+*.pt
+*.csv
+logs/
+results/
+out*/
+

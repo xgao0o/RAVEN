@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# Data (not committed)
+data/
+EHRSHOT_Data/
+mapping/
+eval_data/
+*.shelve*
+*.npy
+*.pkl
+*.tsv
+*.csv
+
+# Outputs
+wandb/
+lightning_logs/
+.ipynb_checkpoints/
+logs/
+out_*/
+scaling_*/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
