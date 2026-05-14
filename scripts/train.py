@@ -332,19 +332,6 @@ while do_train:
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        if iter_num > 0:
-            checkpoint = {
-                'model': raw_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'best_val_loss': best_val_loss,
-                'config': config,
-            }
-        
-        with open(os.path.join(out_dir, 'loss_logs.pkl'), 'wb') as f:
-            pickle.dump(all_losses, f)
-
         if iter_num == 0 and eval_only:
             break
 
@@ -372,22 +359,13 @@ while do_train:
         scaler.scale(loss).backward()
         micro_step += 1
 
-        if master_process:
-            total_norm = 0
-            if iter_num > 1:
-                for name, param in model.named_parameters():
-                    if param.requires_grad and param.grad is not None:
-                        param_norm = param.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-
+        total_norm = 0.0
         if micro_step == gradient_accumulation_steps:
             if grad_clip != 0.0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    log_nan_info(f"grad_{name}", param.grad)
+                grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                if master_process and (iter_num % log_interval == 0):
+                    total_norm = grad_norm_tensor.item()
 
             scaler.step(optimizer)
             scaler.update()
@@ -441,7 +419,22 @@ while do_train:
         local_iter_num += 1
         if iter_num>0 and iter_num % save_interval == 0 and master_process:
             print(f"saving checkpoint to {out_dir}")
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'best_val_loss': best_val_loss,
+                'config': config,
+            }
             torch.save(checkpoint, os.path.join(out_dir, f'ckpt-{iter_num}.pt'))
+            checkpoint = None  # free memory
+            with open(os.path.join(out_dir, 'loss_logs.pkl'), 'wb') as f:
+                pickle.dump(all_losses, f)
+        elif master_process and iter_num % (log_interval * 100) == 0:
+            # periodic loss-log snapshot, much less frequent than every iter
+            with open(os.path.join(out_dir, 'loss_logs.pkl'), 'wb') as f:
+                pickle.dump(all_losses, f)
 
         # termination conditions
         if iter_num > max_iters:
