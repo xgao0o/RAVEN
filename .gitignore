@@ -10,23 +10,35 @@ build/
 # Data (not committed)
 data/
 EHRSHOT_Data/
+ehrshot_data/
 mapping/
 eval_data/
 *.shelve*
 *.npy
+*.npz
 *.pkl
 *.tsv
 *.csv
+*.parquet
+*.pt
+*.pth
+*.ckpt
 
 # Outputs
 wandb/
 lightning_logs/
 .ipynb_checkpoints/
 logs/
+output/
+evaluation_results*/
 out_*/
 scaling_*/
 
 # IDE
 .idea/
 .vscode/
+.claude/
+.codex/
+.env
+.env.*
 .DS_Store

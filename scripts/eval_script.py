@@ -10,8 +10,9 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import BertForPreTraining, BertConfig
 from tqdm import tqdm
 from glob import glob
-from sklearn.metrics import precision_recall_curve, roc_curve, average_precision_score, roc_auc_score
+from sklearn.metrics import precision_recall_curve, roc_curve
 import matplotlib.pyplot as plt
+from raven.bootstrap import patient_bootstrap_ci, patient_bootstrap_indices
 
 # --- 1. Constants (From your working block) ---
 PAD_ID = 0
@@ -20,7 +21,7 @@ CLS_ID = 2
 MASK_ID = 3
 UNK_ID = 4
 headers_special = ['PAD_ID', 'SEP_ID', 'CLS_ID', 'MASK_ID', 'UNK_ID']
-N_BOOTSTRAP_FOLDS = 100
+N_BOOTSTRAP_FOLDS = 1000
 
 # --- 2. Your Exact Working Dataset Class ---
 class SeqCLSDataset(Dataset):
@@ -144,6 +145,7 @@ class SeqCLSDataset(Dataset):
             'attention_mask':torch.tensor(attn_mask, dtype=torch.long), 
             'token_type_ids':torch.tensor(encounter_pos_embed, dtype=torch.long),
             'position_ids':torch.tensor(days_embed_arr, dtype=torch.long),
+            'patient_id': str(key).split('_', 1)[0],
             'labels':torch.tensor([label], dtype=torch.long)
         }
 
@@ -196,6 +198,7 @@ def evaluate(model, dataset, batch_size, device):
     
     all_probs = []
     all_labels = []
+    all_patient_ids = []
 
     for batch in tqdm(loader, desc="Evaluating"):
         logits = model(
@@ -208,61 +211,59 @@ def evaluate(model, dataset, batch_size, device):
         
         all_probs.extend(probs.cpu().numpy())
         all_labels.extend(batch['labels'].flatten().cpu().numpy())
+        all_patient_ids.extend(batch['patient_id'])
 
-    return np.array(all_probs), np.array(all_labels)
+    return np.array(all_probs), np.array(all_labels), np.asarray(all_patient_ids, dtype=str)
 
-def save_metrics_and_plot(probs, labels, output_dir, file_prefix):
-    if len(labels) == 0: return None
-    
-    # Calculate CI using Bootstrap
-    aps, aucs = [], []
+def save_metrics_and_plot(probs, labels, output_dir, file_prefix, patient_ids,
+                          n_bootstraps=N_BOOTSTRAP_FOLDS, bootstrap_type='stratified',
+                          confidence_level=0.95, random_seed=42):
+    if len(labels) == 0:
+        return None
+    ci, n_patients, n_positive_patients = patient_bootstrap_ci(
+        probs, labels, patient_ids, n_bootstraps=n_bootstraps,
+        bootstrap_type=bootstrap_type, confidence_level=confidence_level,
+        random_seed=random_seed,
+    )
     mean_rec = np.linspace(0, 1, 100)
     mean_fpr = np.linspace(0, 1, 100)
     ppvs, tprs = [], []
-
-    for _ in range(N_BOOTSTRAP_FOLDS):
-        ix = np.random.choice(len(labels), size=int(0.8*len(labels)), replace=True)
-        if len(np.unique(labels[ix])) < 2: continue
-        
-        # Metrics
-        aps.append(average_precision_score(labels[ix], probs[ix]))
-        aucs.append(roc_auc_score(labels[ix], probs[ix]))
-        
-        # Curves
-        p, r, _ = precision_recall_curve(labels[ix], probs[ix])
-        ppvs.append(np.interp(mean_rec, r[::-1], p[::-1]))
-        
-        fpr, tpr, _ = roc_curve(labels[ix], probs[ix])
+    for indices in patient_bootstrap_indices(labels, patient_ids, n_bootstraps,
+                                              bootstrap_type, random_seed):
+        if len(np.unique(labels[indices])) < 2:
+            continue
+        precision, recall, _ = precision_recall_curve(labels[indices], probs[indices])
+        ppvs.append(np.interp(mean_rec, recall[::-1], precision[::-1]))
+        fpr, tpr, _ = roc_curve(labels[indices], probs[indices])
         tprs.append(np.interp(mean_fpr, fpr, tpr))
 
-    # Stats
-    auprc_mean, auprc_std = np.mean(aps), np.std(aps)
-    auroc_mean, auroc_std = np.mean(aucs), np.std(aucs)
-
-    # Plot
+    alpha = 1 - confidence_level
     plt.figure(figsize=(20, 9))
-    
-    # PR
-    ax1 = plt.subplot(121)
-    mean_ppv = np.mean(ppvs, axis=0)
-    ax1.plot(mean_rec, mean_ppv, label=f'AUPRC: {auprc_mean:.4f}')
-    ax1.fill_between(mean_rec, np.maximum(mean_ppv-np.std(ppvs, axis=0),0), np.minimum(mean_ppv+np.std(ppvs, axis=0),1), alpha=0.2, color='blue')
-    ax1.set_title("PR Curve"); ax1.legend()
-    
-    # ROC
-    ax2 = plt.subplot(122)
-    mean_tpr = np.mean(tprs, axis=0)
-    ax2.plot(mean_fpr, mean_tpr, label=f'AUROC: {auroc_mean:.4f}')
-    ax2.fill_between(mean_fpr, np.maximum(mean_tpr-np.std(tprs, axis=0),0), np.minimum(mean_tpr+np.std(tprs, axis=0),1), alpha=0.2, color='blue')
-    ax2.set_title("ROC Curve"); ax2.legend()
-    
-    plt.savefig(os.path.join(output_dir, f"{file_prefix}_curves.png"))
+    for index, grid, curves, name in [(1, mean_rec, ppvs, 'auprc'), (2, mean_fpr, tprs, 'auroc')]:
+        axis = plt.subplot(1, 2, index)
+        if curves:
+            lower, upper = np.percentile(curves, [100 * alpha / 2, 100 * (1 - alpha / 2)], axis=0)
+            axis.plot(grid, np.mean(curves, axis=0), label=f"{name.upper()}: {ci[name]['point_estimate']:.4f}")
+            axis.fill_between(grid, lower, upper, alpha=0.2,
+                              label=f'{confidence_level:.0%} patient-bootstrap band')
+            axis.legend()
+        axis.set_title('PR Curve' if index == 1 else 'ROC Curve')
+        axis.set_xlabel('Recall' if index == 1 else 'False positive rate')
+        axis.set_ylabel('Precision' if index == 1 else 'True positive rate')
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, f'{file_prefix}_curves.png'))
     plt.close()
-
-    return {
-        "auprc": auprc_mean, "auprc_std": auprc_std,
-        "auroc": auroc_mean, "auroc_std": auroc_std
-    }
+    np.savez(os.path.join(output_dir, f'{file_prefix}_predictions.npz'),
+             scores=probs, labels=labels, patient_ids=np.asarray(patient_ids, dtype=str))
+    result = dict(bootstrap_unit='patient', bootstrap_type=bootstrap_type,
+                  confidence_level=confidence_level, n_bootstraps=n_bootstraps,
+                  random_seed=random_seed, n_windows=len(labels), n_patients=n_patients,
+                  n_positive_patients=n_positive_patients)
+    for metric, stats in ci.items():
+        result.update({metric: stats['point_estimate'], metric + '_std': stats['std'],
+                       metric + '_ci_lower': stats['lower'], metric + '_ci_upper': stats['upper'],
+                       metric + '_boot_mean': stats['mean'], metric + '_n_valid': stats['n_valid']})
+    return result
 
 # --- 5. Main Execution ---
 def main():
@@ -272,6 +273,10 @@ def main():
     parser.add_argument('--model_base_dir', type=str, required=True)
     parser.add_argument('--data_base_dir', type=str, required=True)
     parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--n_bootstraps', type=int, default=N_BOOTSTRAP_FOLDS)
+    parser.add_argument('--bootstrap_type', choices=['stratified', 'standard'], default='stratified')
+    parser.add_argument('--confidence_level', type=float, default=0.95)
+    parser.add_argument('--bootstrap_seed', type=int, default=42)
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -315,10 +320,14 @@ def main():
     model = load_checkpoint_flexible(model, model_path, device)
 
     # Evaluate
-    probs, labels = evaluate(model, dataset, args.batch_size, device)
+    probs, labels, patient_ids = evaluate(model, dataset, args.batch_size, device)
     
     # Save Results
-    metrics = save_metrics_and_plot(probs, labels, model_dir, f"results_{args.setting}_{args.condition}")
+    metrics = save_metrics_and_plot(
+        probs, labels, model_dir, f"results_{args.setting}_{args.condition}", patient_ids,
+        n_bootstraps=args.n_bootstraps, bootstrap_type=args.bootstrap_type,
+        confidence_level=args.confidence_level, random_seed=args.bootstrap_seed,
+    )
     if metrics:
         with open(os.path.join(model_dir, f"results_{args.setting}_{args.condition}.json"), 'w') as f:
             json.dump(metrics, f, indent=4)

@@ -141,6 +141,8 @@ def load_and_pad_array(file_path, target_size):
     Load numpy array and pad with False at the beginning if needed
     """
     arr = np.load(file_path)
+    if arr.ndim != 1 or arr.size > target_size:
+        raise ValueError(f'Metadata array {file_path} has incompatible shape {arr.shape} for vocabulary size {target_size}')
     if arr.size < target_size:
         padded = np.zeros(target_size, dtype=arr.dtype)
         # Put False at the beginning
@@ -184,7 +186,7 @@ class GPT(nn.Module):
         self.loss_weights = load_and_pad_array(
             os.path.join(config.data_dir, "data_files", f"loss_mask_{config.loss_top_perc}_perc.npy"),
             config.vocab_size
-        ).view(1, 1, config.vocab_size)
+        ).to(torch.float32).view(1, 1, config.vocab_size)
 
         self.loss_track_weights = {}
 
@@ -198,7 +200,7 @@ class GPT(nn.Module):
             curr_weights = load_and_pad_array(
                 os.path.join(config.data_dir, "data_files", f"loss_mask_{perc}_perc.npy"),
                 config.vocab_size
-            ).view(1, 1, config.vocab_size)
+            ).to(torch.float32).view(1, 1, config.vocab_size)
             
             self.loss_track_weights[f"{perc}_{end}"] = curr_weights - prev_perc
             prev_perc = curr_weights
@@ -258,7 +260,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx,days, targets, target_mask, pad_mask, batch_bias, temporal_weights = None, patient_ids = None):
+    def forward(self, idx,days, targets, target_mask, pad_mask, batch_bias, temporal_weights = None, patient_ids = None, loss_only=False,
+                prediction_only=False, output_indices=None):
+        if prediction_only and (targets is not None or loss_only):
+            raise ValueError('prediction_only requires inference without targets or loss_only')
+        if output_indices is not None and not prediction_only:
+            raise ValueError('output_indices requires prediction_only=True')
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -280,7 +287,26 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
 
-        logits = self.lm_head(x)
+        # Keep the full transformer context, but project only supervised positions
+        # during training. The default dense output remains available for inference.
+        if prediction_only:
+            head_input = x[target_mask.bool()]
+        elif loss_only:
+            if targets is None:
+                raise ValueError('loss_only requires targets')
+            prediction_mask = target_mask.bool()
+            head_input = x[prediction_mask].unsqueeze(0)
+            targets = targets.unsqueeze(0) if targets.ndim == 2 else targets[prediction_mask].unsqueeze(0)
+            if temporal_weights is not None:
+                temporal_weights = (temporal_weights.unsqueeze(0) if temporal_weights.ndim == 2
+                                    else temporal_weights[prediction_mask].unsqueeze(0))
+            target_mask = torch.ones(head_input.shape[:2], device=device, dtype=torch.bool)
+        else:
+            head_input = x
+        if output_indices is None:
+            logits = self.lm_head(head_input)
+        else:
+            logits = F.linear(head_input, self.lm_head.weight.index_select(0, output_indices))
         logits = logits.to(torch.float32)
 
         if targets is None:
@@ -294,7 +320,11 @@ class GPT(nn.Module):
         if self.config.loss_type=="FL":
             loss = loss* (10**(self.config.gamma//2))
 
-        self.loss_weights = self.loss_weights.to(device)
+        if self.loss_weights.device != device:
+            self.loss_weights = self.loss_weights.to(device)
+            self.num_outs = self.num_outs.to(device)
+            for key in self.loss_track_weights:
+                self.loss_track_weights[key] = self.loss_track_weights[key].to(device)
         weighted_loss = self.loss_weights  * loss 
 
         if temporal_weights is not None:
@@ -304,11 +334,15 @@ class GPT(nn.Module):
 
 
         loss_components = {}
-        for key in self.loss_track_weights.keys():
-            self.loss_track_weights[key] = self.loss_track_weights[key].to(device)
-            loss_components[f"step_train/{key}"] = ((self.loss_track_weights[key]*weighted_loss).sum()  / (target_mask.sum() * self.loss_track_weights[key].sum())).item()
+        target_count = target_mask.sum()
+        for key, weights in self.loss_track_weights.items():
+            component = ((weights * weighted_loss).sum() /
+                         (target_count * weights.sum()).clamp_min(1)).detach()
+            # Avoid synchronizing the GPU for each loss component in the hot path.
+            loss_components[f"step_train/{key}"] = component if loss_only else component.item()
 
-        return logits, weighted_loss.sum() / (target_mask.sum()* self.num_outs),loss_components, x
+        loss = weighted_loss.sum() / (target_count * self.num_outs).clamp_min(1)
+        return (None if loss_only else logits), loss, loss_components, x
 
     def crop_block_size(self, block_size):
         assert block_size <= self.config.block_size
@@ -409,7 +443,7 @@ class GPT(nn.Module):
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
+    def estimate_mfu(self, fwdbwd_per_iter, dt, prediction_positions=None):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
@@ -419,6 +453,9 @@ class GPT(nn.Module):
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        if prediction_positions is not None:
+            unused_positions = fwdbwd_per_iter * T - prediction_positions
+            flops_per_iter -= 6 * self.lm_head.weight.numel() * unused_positions
         # express our flops throughput as ratio of A100 bfloat16 peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS

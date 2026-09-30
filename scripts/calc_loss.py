@@ -27,6 +27,7 @@ def parse_args():
     p = argparse.ArgumentParser("Compute test-set loss for a trained model.")
     p.add_argument('--out_dir', type=str, required=True, help='Directory with checkpoints and config.json')
     p.add_argument('--folder', type=str, required=True, help='Data folder used by UnifiedSeqEHRDataset')
+    p.add_argument('--metadata_folder', help='Loss metadata folder; defaults to --folder')
     p.add_argument('--csv_folder', type=str, required=True, help='Folder containing split CSVs (e.g., test.csv)')
     p.add_argument('--split', type=str, default='test', help='CSV split name: test/val/train (default: test)')
     p.add_argument('--iteration', type=int, default=None, help='Evaluate specific ckpt-<iter>.pt; if omitted uses latest')
@@ -68,6 +69,7 @@ def load_latest_checkpoint(out_dir, device, iteration=None):
         cfg = json.load(f)
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
+    cfg.update(ckpt.get('config', {}))
     return ckpt, ckpt['model_args'], cfg
 
 @torch.inference_mode()
@@ -112,7 +114,7 @@ def evaluate(model: torch.nn.Module,
 
         # free up
         del token_arr, days_embed_arr, labels, pred_mask, pad_mask, attention_bias, patient_ids, out
-        if empty_cache_every and ((i + 1) % empty_cache_every == 0):
+        if device.type == 'cuda' and empty_cache_every and ((i + 1) % empty_cache_every == 0):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
@@ -148,7 +150,8 @@ def main():
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # Build model config strictly from saved args
-    model_args = {k: ckpt_model_args[k] for k in GPTCONFIG_PARAMS}
+    model_args = {k: ckpt_model_args[k] for k in GPTCONFIG_PARAMS if k in ckpt_model_args}
+    model_args['data_dir'] = args.metadata_folder or args.folder
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 

@@ -44,6 +44,7 @@ class SeqCLSDatasetEHRSHOT(Dataset):
             max_length: Context window size
             time_horizon: Prediction window size in days
             approach: 'direct' or 'intermediate_pred'
+            multiwin: Include the patient-position embedding used by packed training.
         """
         print(f"Loading data from {data_path}...")
         with open(data_path, 'rb') as f:
@@ -86,7 +87,7 @@ class SeqCLSDatasetEHRSHOT(Dataset):
             current_day = int(visit['days'])
             
             visit_tokens = visit['tokens']
-            visit_tokens = [t + 6 for t in visit_tokens] # Removed this assumption. User provided token IDs.
+            visit_tokens = [t + 6 for t in visit_tokens] # Raw feature IDs exclude the six special tokens.
             
             flat_tokens.extend(visit_tokens)
             flat_days.extend([current_day] * len(visit_tokens))
@@ -169,4 +170,3 @@ class SeqCLSDatasetEHRSHOT(Dataset):
             
         else:
             raise NotImplementedError("Only 'direct' approach implemented for simplified dataset.")
-

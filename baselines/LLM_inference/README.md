@@ -19,7 +19,7 @@ Evaluates patient outcomes over specific time horizons for various conditions:
 
 Requires a GPU with high memory capacity (e.g., A100-80GB) to run larger models like `medgemma-27b-it`.
 
-1. **Environment**: Ensure `vllm` and `transformers` are installed (see root `requirements.txt`).
+1. **Environment**: Ensure `vllm` and `transformers` are installed (see `baselines/requirements.txt`).
 2. **Hugging Face Token**: Ensure your `HF_TOKEN` is set as an environment variable to access gated models:
    ```bash
    export HF_TOKEN="your_huggingface_token_here"

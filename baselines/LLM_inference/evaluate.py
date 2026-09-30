@@ -1,7 +1,6 @@
 import json, re, pickle, math, os, argparse
 import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
-from vllm import LLM, SamplingParams
 
 # ===== 1) Args & vLLM Initialization =====
 parser = argparse.ArgumentParser(description="Clinical Evaluation: Unified LLM Inference")
@@ -16,7 +15,8 @@ parser.add_argument("--condition", type=str, required=True, choices=[
 
 args, unknown = parser.parse_known_args()
 
-os.environ['HF_TOKEN'] = "********"
+# Preserve HF_TOKEN supplied by the caller. Import vLLM after --help can exit.
+from vllm import LLM, SamplingParams
 
 # Hardcoded optimal parameters
 MAX_TOKENS = 256
@@ -244,7 +244,7 @@ for i, out in enumerate(outputs):
     })
 
 # Save results
-os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
 with open(args.output_file, "wb") as f:
     pickle.dump(results, f)
 

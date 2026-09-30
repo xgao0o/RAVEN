@@ -1,31 +1,13 @@
-import sys
-from glob import glob  # This imports the function
-import pandas as pd
+"""Condition-evaluation datasets and score aggregation."""
+from glob import glob
+import json
+import os
+from pathlib import Path
 import shelve
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from tqdm import tqdm
-
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from torch.utils.data import DataLoader
-import pandas as pd
-from dataclasses import dataclass
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from multiprocessing import Pool, cpu_count
-
-from raven.model import GPTConfig, GPT
-from raven.dataset import UnifiedSeqEHRDataset, custom_collate
-from sklearn.metrics import precision_recall_curve
-import argparse
-import torch.multiprocessing as mp
-import json
-import os
 
 GPTCONFIG_PARAMS = [
     'block_size',
@@ -56,35 +38,72 @@ UNK_ID = 4
 EOW_ID = 5
 
 class SeqCLSDataset(Dataset):
-    def __init__(self,mode = "val", max_length=512, folder="./data/",  multiwin=False,time_horizon = 365*4,approach = "direct", num_patients = -1,horizon = 365 ):
-        files = sorted(glob(folder + "data_{}*.shelve.dat".format(mode)))
+    def __init__(self,mode = "val", max_length=512, folder="./data/",  multiwin=False,time_horizon = 365*4,approach = "direct", num_patients = -1,horizon = 365,
+                 metadata_folder=None, seed=1037, vocab_size=None):
+        if max_length < 2 or time_horizon <= 0 or horizon <= 0:
+            raise ValueError('max_length must be >= 2 and horizons must be positive')
+        if num_patients < -1 or num_patients == 0:
+            raise ValueError('num_patients must be -1 or positive')
+        if approach not in ('direct', 'intermediate_pred'):
+            raise ValueError(f'Unknown approach: {approach}')
+        # Support both dbm.dumb (*.dat) and single-file dbm shelves.
+        files = sorted({str(path).removesuffix('.dat') for pattern in
+                        (f'data_{mode}*.shelve.dat', f'data_{mode}*.shelve')
+                        for path in Path(folder).glob(pattern)})
+        if not files:
+            raise FileNotFoundError(f'No {mode} shelves found in {folder}')
         self.keys, self.feats, self.labels = [], [], []
         self.folder = folder
         self.db_dict = {}
+        self.db_paths = files
+        self.db_pid = os.getpid()
         self.data_list = []
-        for i, file in tqdm(enumerate(files)):
-            self.db_dict[i] = shelve.open(file.strip(".dat"))
-        for k, v in self.db_dict.items():
-            for key in v.keys():
-                self.data_list.append((k, key))
+        for i, file in enumerate(files):
+            with shelve.open(file, flag='r') as db:
+                self.data_list.extend((i, key) for key in sorted(db.keys()))
 
         if num_patients!=-1:
-            np.random.shuffle(self.data_list)
+            # All ranks must select the same cohort before dividing it up.
+            np.random.RandomState(seed).shuffle(self.data_list)
             self.data_list = self.data_list[:num_patients]
+        if not self.data_list:
+            raise ValueError(f'The {mode} cohort is empty')
 
                     
         self.max_length = max_length
         self.horizon = horizon
         
-        print("Open db files:")
+        print(f"Loaded {len(self.data_list)} {mode} cohort records")
         self.time_horizon = time_horizon
         self.approach = approach
         
         self.multiwin = multiwin
-        remove_inds = np.load(os.path.join(folder, "data_files", "delete_inds.npy"))
-        total_prev_tokens = 57735
+        metadata_folder = Path(metadata_folder or folder)
+        manifest_path = metadata_folder / 'dataset_manifest.json'
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        if manifest and manifest.get('status') != 'complete':
+            raise ValueError(f'Dataset metadata is incomplete: {metadata_folder}')
+        remove_inds = np.load(metadata_folder / 'data_files/delete_inds.npy')
+        total_prev_tokens = manifest.get('source_width', 57735)
         self.keep_mask = np.ones(total_prev_tokens, dtype=bool)
         self.keep_mask[remove_inds] = False
+        self.day_column = manifest.get('relative_day_filtered_column', 35845)
+        if vocab_size is not None and int(self.keep_mask.sum()) + 6 != vocab_size:
+            raise ValueError('Checkpoint vocabulary does not match the downstream feature metadata')
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['db_dict'] = {}
+        return state
+
+    def _get_db(self, part):
+        # Open independent, read-only handles inside each loader worker.
+        if self.db_pid != os.getpid():
+            self._cleanup()
+            self.db_pid = os.getpid()
+        if part not in self.db_dict:
+            self.db_dict[part] = shelve.open(self.db_paths[part], flag='r')
+        return self.db_dict[part]
     
 
     def _pad_matrix(self, matrix, target_size):
@@ -102,7 +121,7 @@ class SeqCLSDataset(Dataset):
 
     def __getitem__(self, idx):
         k, key = self.data_list[idx]
-        datum = self.db_dict[k][key]
+        datum = self._get_db(k)[key]
 
         """
         'Diagnosis:Anterograde amnesia R41.1' (15099),
@@ -113,10 +132,12 @@ class SeqCLSDataset(Dataset):
         a = datum[1]
         # a[:, [15099, 15100, 15101]] = 0
         label = datum[2]
+        if a.shape[1] != len(self.keep_mask):
+            raise ValueError('Downstream feature width does not match the selected metadata')
         a = a[:, self.keep_mask]
 
-        column_to_delete = 35845  # day of the visit
-        days_data = a[:, column_to_delete].toarray().astype("int").squeeze()
+        column_to_delete = self.day_column
+        days_data = a[:, column_to_delete].toarray().astype("int").ravel()
 
         days_arr, token_arr = np.nonzero(a)
         delete_idx = (token_arr != column_to_delete)
@@ -181,6 +202,8 @@ class SeqCLSDataset(Dataset):
                 'pred_mask': pred_mask,
                 'pad_mask': pad_mask,
                 'attention_bias': attention_bias,
+                'patient_id': str(key).split('_', 1)[0],
+                'record_id': f'{k}:{key}',
                 'labels':torch.from_numpy(np.array([label])).to(torch.int64)
             }
 
@@ -251,6 +274,8 @@ class SeqCLSDataset(Dataset):
                 'pred_mask': pred_mask,
                 'pad_mask': pad_mask,
                 'attention_bias': attention_bias,
+                'patient_id': str(key).split('_', 1)[0],
+                'record_id': f'{k}:{key}',
                 'labels': torch.from_numpy(np.array([label])).to(torch.int64)
             }
             
@@ -266,7 +291,9 @@ class SeqCLSDataset(Dataset):
         return len(self.data_list)
 
     def _cleanup(self):
-        del self.db_dict
+        for db in self.db_dict.values():
+            db.close()
+        self.db_dict.clear()
 def aggregate_logits(logits_masked, mask, method="sum", dim=1):
     """
     Aggregate logits using different methods
@@ -333,5 +360,3 @@ def load_latest_checkpoint(out_dir, device):
     checkpoint_model_args = checkpoint['model_args']
     
     return checkpoint, checkpoint_model_args,config
-
-

@@ -1,282 +1,218 @@
-import sys
+"""Zero-shot condition evaluation with one inference pass per split."""
+import argparse
+from contextlib import nullcontext
+from dataclasses import fields
+from datetime import timedelta
+from glob import glob
+import json
 import os
-os.environ["NCCL_TIMEOUT"] = "1200"  # 20 minutes instead of 10
+from pathlib import Path
+import time
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import json
-import matplotlib.pyplot as plt
-from sklearn.metrics import precision_recall_curve, auc, average_precision_score, precision_score, recall_score, f1_score, roc_auc_score
-from tqdm import tqdm
-import pandas as pd
-from glob import glob
-import argparse
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader, Subset
+from sklearn.metrics import (precision_recall_curve, auc, average_precision_score,
+                             precision_score, recall_score, f1_score, roc_auc_score)
 
 from raven.model import GPTConfig, GPT
-from raven.dataset import custom_collate
-from data_processing.condition_helper import SeqCLSDataset, aggregate_logits, GPTCONFIG_PARAMS
+from data_processing.condition_helper import SeqCLSDataset, aggregate_logits
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Distributed Condition Model Evaluation')
-    parser.add_argument('--out_dir', type=str, required=True, help='Output directory for model checkpoints and results')
-    parser.add_argument('--data_path', type=str, required=True, help='Path to preprocessed data')
-    parser.add_argument('--condition_indices_path', type=str, required=True, help='Path to condition indices json file')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--out_dir', required=True, help='Checkpoint and result directory')
+    parser.add_argument('--results_dir', help='Explicit output directory; defaults to a named directory under out_dir')
+    parser.add_argument('--data_path', required=True, help='Downstream cohort shelves')
+    parser.add_argument('--condition_indices_path', required=True)
+    parser.add_argument('--metadata_folder', help='Feature metadata; defaults to checkpoint data_dir')
+    parser.add_argument('--iteration', type=int, help='Checkpoint iteration; defaults to latest')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size per GPU')
-    parser.add_argument('--agg_method', type=str, default='sum', choices=['sum', 'noisy_or', 'max', 'logsumexp', 'geometric_mean', 'attention'], help='Method for aggregating logits')
-    parser.add_argument('--condition_name', type=str, default='Dementia', help='Condition to evaluate')
-    parser.add_argument('--multiwin', action='store_true', help='Use multi-window approach')
-    parser.add_argument('--time_horizon', type=int, default=730, help='Time horizon in days (default: 365*2)')
-    parser.add_argument('--n_gather', type=int, default=100, help='Frequency of gathering results across GPUs')
-    parser.add_argument('--num_patients', type=int, default=512, help='No of patiemts to use')
-    parser.add_argument('--approach', type=str, default='direct', choices=['direct', 'intermediate_pred'], help='Method for multi horizon prediction')
-    parser.add_argument('--intermediate_horizon', type=int, default=365, help='intermediate horizon to use')
-    parser.add_argument('--intermediate_agg', type=str, default='mean', choices=['mean', 'max'], help='Method for aggregation multi horizon prediction')
-    
-    
-    return parser.parse_args()
+    parser.add_argument('--num_workers', type=int, default=8, help='Loader workers per GPU')
+    parser.add_argument('--prefetch_factor', type=int, default=2)
+    parser.add_argument('--max_length', type=int, default=512, help='History context length, including final SEP')
+    parser.add_argument('--dtype', choices=['float32', 'bfloat16', 'float16'], default='float32',
+                        help='Inference precision; mixed precision is opt-in')
+    parser.add_argument('--agg_method', default='sum',
+                        choices=['sum', 'noisy_or', 'max', 'logsumexp', 'geometric_mean', 'attention'])
+    parser.add_argument('--score_space', choices=['probability', 'logit'], default='probability',
+                        help='logit ranks raw summed logits without sigmoid underflow; requires direct + sum')
+    parser.add_argument('--condition_name', default='Dementia')
+    parser.add_argument('--multiwin', action='store_true')
+    parser.add_argument('--time_horizon', type=int, default=730)
+    parser.add_argument('--n_gather', type=int, default=100,
+                        help='Batches per CPU score flush; results are gathered once per split')
+    parser.add_argument('--num_patients', type=int, default=512,
+                        help='Number of cohort records/windows; -1 evaluates all records')
+    parser.add_argument('--seed', type=int, default=1037, help='Shared cohort sampling seed')
+    parser.add_argument('--approach', default='direct', choices=['direct', 'intermediate_pred'])
+    parser.add_argument('--intermediate_horizon', type=int, default=365)
+    parser.add_argument('--intermediate_agg', default='mean', choices=['mean', 'max'])
+    parser.add_argument('--skip_sample_logits', action='store_true',
+                        help='Skip per-batch validation horizon files to reduce filesystem I/O')
+    args = parser.parse_args()
+    if min(args.batch_size, args.prefetch_factor, args.n_gather) <= 0 or args.num_workers < 0:
+        parser.error('batch_size, prefetch_factor, n_gather must be positive; num_workers must be nonnegative')
+    if args.score_space == 'logit' and (args.approach != 'direct' or args.agg_method != 'sum'):
+        parser.error('logit score_space requires direct prediction and sum aggregation')
+    return args
+
+
+def threshold_above_scores(scores):
+    """Represent the PR endpoint that predicts no positives in any score space."""
+    values = np.asarray(scores)
+    dtype = values.dtype if np.issubdtype(values.dtype, np.floating) else np.dtype('float64')
+    return float(np.nextafter(values.max().astype(dtype), np.array(np.inf, dtype=dtype)))
+
 
 def find_optimal_threshold(y_true, y_scores, metric='f1'):
-    """
-    Find the optimal threshold to maximize a given metric.
-    
-    Args:
-        y_true: Ground truth labels
-        y_scores: Predicted scores
-        metric: Metric to optimize ('f1', 'precision', or 'recall')
-        
-    Returns:
-        optimal_threshold: The threshold that maximizes the metric
-    """
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_scores)
-    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
-    
-    if metric == 'f1':
-        optimal_idx = np.argmax(f1_scores)
-    elif metric == 'precision':
-        optimal_idx = np.argmax(precisions)
-    elif metric == 'recall':
-        optimal_idx = np.argmax(recalls)
-    else:
-        raise ValueError(f"Unknown metric: {metric}")
-    
-    # Handle edge case where the optimal threshold is at the end of the array
-    if optimal_idx >= len(thresholds):
-        return 1.0
-    
-    return thresholds[optimal_idx]
+    precisions, recalls, thresholds = precision_recall_curve(np.ravel(y_true), np.ravel(y_scores))
+    values = {'f1': 2 * precisions * recalls / (precisions + recalls + 1e-8),
+              'precision': precisions, 'recall': recalls}
+    if metric not in values:
+        raise ValueError(f'Unknown metric: {metric}')
+    optimal_idx = np.argmax(values[metric])
+    return thresholds[optimal_idx] if optimal_idx < len(thresholds) else threshold_above_scores(y_scores)
 
+
+def classification_metrics(labels, scores, threshold):
+    labels, scores = np.ravel(labels), np.ravel(scores)
+    predictions = scores >= threshold
+    return {
+        'precision': precision_score(labels, predictions, zero_division=0),
+        'recall': recall_score(labels, predictions, zero_division=0),
+        'f1': f1_score(labels, predictions, zero_division=0),
+        'auroc': roc_auc_score(labels, scores) if np.unique(labels).size > 1 else float('nan'),
+        'auprc': average_precision_score(labels, scores),
+    }
+
+
+@torch.inference_mode(False)
 def gather_variable_results(tensor, rank, world_size):
-    """
-    Gather tensors of variable sizes from all GPUs.
-    
-    Args:
-        tensor: Local tensor to gather
-        rank: Rank of current process
-        world_size: Total number of processes
-        
-    Returns:
-        result: Gathered tensor on rank 0, None on other ranks
-    """
-    local_size = torch.tensor([tensor.shape[0]], dtype=torch.long, device=tensor.device)
-    
-    all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
-    dist.all_gather(all_sizes, local_size)
-    all_sizes = [size.item() for size in all_sizes]
-    
-    max_size = max(all_sizes)
-    
-    padded_tensor = torch.zeros((max_size,) + tensor.shape[1:], dtype=tensor.dtype, device=tensor.device)
-    padded_tensor[:tensor.shape[0]] = tensor
-    
-    gathered_tensors = [torch.zeros_like(padded_tensor) for _ in range(world_size)]
-    dist.all_gather(gathered_tensors, padded_tensor)
-    
+    """Gather once, including empty shards, allocating receive buffers only on rank 0."""
+    if world_size == 1:
+        return tensor.cpu()
+    # Collectives mutate receive buffers from backend threads outside inference
+    # mode, so those buffers must be ordinary tensors (including on Gloo).
+    local_size = torch.tensor([len(tensor)], dtype=torch.long, device=tensor.device)
+    sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+    dist.all_gather(sizes, local_size)
+    sizes = [int(size.item()) for size in sizes]
+    max_size = max(sizes)
+    if max_size == 0:
+        return tensor.cpu() if rank == 0 else None
+    padded = tensor.new_zeros((max_size,) + tensor.shape[1:])
+    padded[:len(tensor)] = tensor
+    received = [torch.empty_like(padded) for _ in range(world_size)] if rank == 0 else None
+    dist.gather(padded, gather_list=received, dst=0)
     if rank == 0:
-        result = torch.cat([tensor[:size] for tensor, size in zip(gathered_tensors, all_sizes)])
-        return result.cpu()
-    else:
-        return None
+        return torch.cat([value[:size] for value, size in zip(received, sizes)]).cpu()
+    return None
 
-@torch.no_grad()
-def evaluate_model_distributed(model, dataloader, device, condition_indices, condition_name="Dementia", 
-                              agg_method="sum", threshold=0.5, compute_metrics=True, rank=0, world_size=1, n_gather=100, 
-                              approach="direct", intermediate_agg="mean", save_sample_logits=True, output_path=None):
-    """
-    Evaluate the model on a dataset in a distributed setting.
-    
-    Args:
-        model: The GPT model
-        dataloader: DataLoader for the dataset
-        device: Device to run evaluation on
-        condition_indices: Dictionary mapping condition names to indices
-        condition_name: The condition to evaluate
-        agg_method: Method for aggregating logits
-        threshold: Classification threshold
-        compute_metrics: Whether to compute and return metrics
-        rank: Process rank
-        world_size: Total number of processes
-        n_gather: How often to gather results across processes
-        
-    Returns:
-        all_labels: Ground truth labels (on rank 0 only)
-        all_scores: Predicted scores (on rank 0 only)
-        metrics: Dictionary of evaluation metrics (if compute_metrics=True, on rank 0 only)
-    """
+
+@torch.inference_mode()
+def evaluate_model_distributed(model, dataloader, device, condition_indices, condition_name='Dementia',
+                               agg_method='sum', threshold=0.5, compute_metrics=True, rank=0,
+                               world_size=1, n_gather=100, approach='direct', intermediate_agg='mean',
+                               save_sample_logits=True, output_path=None, dtype='float32',
+                               score_space='probability', return_identifiers=False):
+    """Score each local record once; uneven ranks communicate only after inference."""
+    if n_gather <= 0:
+        raise ValueError('n_gather must be positive')
+    if approach not in ('direct', 'intermediate_pred') or intermediate_agg not in ('mean', 'max'):
+        raise ValueError('Unknown prediction approach or intermediate aggregation')
+    if score_space not in ('probability', 'logit'):
+        raise ValueError('Unknown score space')
+    if score_space == 'logit' and (approach != 'direct' or agg_method != 'sum'):
+        raise ValueError('logit score_space requires direct prediction and sum aggregation')
+    device = torch.device(device)
     model.eval()
-    batch_logits = []
-    batch_labels = []
-    
-    # Get condition indices for the specific condition
-    cond_ind = condition_indices[condition_name]
-    N_C = 42343  # Total number of classes
-    
-    # Create mask for the condition
-    condition_mask = torch.zeros((N_C), dtype=torch.bool, device=device)
-    condition_mask[cond_ind] = True
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            
-            # Handle patient_ids if present (for multiwin)
-            patient_ids = batch.get('patient_ids', None)
-
-            if approach =="direct":
-
-            
-                # Forward pass
+    # Sorting and deduplication preserve the original boolean vocabulary mask's order.
+    indices = sorted(set(condition_indices[condition_name]))
+    if not indices or min(indices) < 0 or max(indices) >= model.config.vocab_size:
+        raise ValueError(f'Invalid condition indices for vocabulary size {model.config.vocab_size}')
+    selected = torch.tensor(indices, dtype=torch.long, device=device)
+    selected_mask = torch.ones(len(indices), dtype=torch.bool, device=device)
+    ctx = (torch.autocast(device_type=device.type, dtype=getattr(torch, dtype))
+           if dtype != 'float32' else nullcontext())
+    sample_dir = None
+    if approach == 'intermediate_pred' and save_sample_logits and output_path:
+        sample_dir = Path(output_path) / 'sample_logits'
+        sample_dir.mkdir(parents=True, exist_ok=True)
+    pending = []
+    chunks = []
+    local_identifiers = {'patient_ids': [], 'record_ids': []}
+    for batch_idx, batch in enumerate(dataloader):
+        batch = {key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+                 for key, value in batch.items()}
+        patient_ids = batch.get('patient_ids')
+        days = batch['days_embed_arr']
+        horizons = [days] if approach == 'direct' else days.unbind(dim=1)
+        horizon_scores = []
+        for horizon_days in horizons:
+            with ctx:
                 logits, _, _, _ = model(
-                    batch['token_arr'],
-                    batch['days_embed_arr'],
-                    None,
-                    batch['pred_mask'],
-                    batch['pad_mask'],
-                    batch['attention_bias'],
-                    patient_ids=patient_ids
+                    batch['token_arr'], horizon_days, None, batch['pred_mask'], batch['pad_mask'],
+                    batch['attention_bias'], patient_ids=patient_ids,
+                    prediction_only=True, output_indices=selected,
                 )
-                
-                # Get masked logits
-                masked_logits = logits[batch['pred_mask']]
-                
-                # Aggregate logits for the condition
-                agg_logits = aggregate_logits(masked_logits, condition_mask, method=agg_method, dim=1)
-            else:
-                full_logits = []
+            # Sigmoid is strictly increasing in exact arithmetic, but very negative
+            # FP32 sums underflow to zero and erase rankings. Keep the sum itself.
+            horizon_scores.append(logits.float().sum(dim=1) if score_space == 'logit' else
+                                  aggregate_logits(logits, selected_mask, method=agg_method, dim=1))
+        if approach == 'direct':
+            scores = horizon_scores[0]
+        else:
+            full_logits = torch.stack(horizon_scores)
+            if sample_dir is not None:
+                save_data = {'logits': full_logits.cpu(), 'labels': batch['labels'].cpu(),
+                             'batch_idx': batch_idx, 'rank': rank}
+                if patient_ids is not None:
+                    save_data['patient_ids'] = patient_ids.cpu()
+                torch.save(save_data, sample_dir / f'logits_{rank}_{batch_idx}.pt')
+            scores = full_logits.mean(0) if intermediate_agg == 'mean' else full_logits.max(0).values
+        labels = batch['labels'].reshape(-1)
+        if scores.numel() != labels.numel():
+            raise ValueError('Expected exactly one prediction per cohort record')
+        if return_identifiers:
+            for field, output in (('patient_id', 'patient_ids'), ('record_id', 'record_ids')):
+                values = batch.get(field)
+                if values is None or len(values) != labels.numel():
+                    raise ValueError(f'Missing or misaligned {field} for patient-level confidence intervals')
+                local_identifiers[output].extend(str(value) for value in values)
+        pending.append(torch.stack((scores, labels), dim=1))
+        if len(pending) == n_gather:
+            chunks.append(torch.cat(pending).cpu())
+            pending.clear()
+    if pending:
+        chunks.append(torch.cat(pending).cpu())
+    local_results = torch.cat(chunks) if chunks else torch.empty((0, 2), dtype=torch.float32)
+    results = gather_variable_results(local_results.to(device), rank, world_size)
+    identifiers = None
+    if return_identifiers:
+        gathered = [local_identifiers]
+        if world_size > 1:
+            gathered = [None] * world_size if rank == 0 else None
+            with torch.inference_mode(False):
+                dist.gather_object(local_identifiers, gathered, dst=0)
+        if rank == 0:
+            identifiers = {key: np.asarray([value for shard in gathered for value in shard[key]], dtype=str)
+                           for key in local_identifiers}
+            if any(len(values) != len(results) for values in identifiers.values()):
+                raise RuntimeError('Gathered identifiers and predictions have different lengths')
+    if rank != 0:
+        return (None, None, None, None) if return_identifiers else (None, None, None)
+    if not len(results):
+        raise ValueError('Evaluation cohort is empty')
+    scores = results[:, 0].numpy()
+    labels = results[:, 1].numpy().astype(np.int64)
+    metrics = classification_metrics(labels, scores, threshold) if compute_metrics else None
+    return (labels, scores, metrics, identifiers) if return_identifiers else (labels, scores, metrics)
 
-                for itr in range(batch['days_embed_arr'].shape[1]):
-                    days_embed_arr = batch['days_embed_arr'][:,itr,:]
-                    
-                    logits, _, _, _ = model(
-                        batch['token_arr'],
-                        days_embed_arr,
-                        None,
-                        batch['pred_mask'],
-                        batch['pad_mask'],
-                        batch['attention_bias'],
-                        patient_ids=patient_ids
-                    )
-                    
-                    # Get masked logits
-                    masked_logits = logits[batch['pred_mask']]
-                    
-                    # Aggregate logits for the condition
-                    agg_logits = aggregate_logits(masked_logits, condition_mask, method=agg_method, dim=1)
-                    full_logits.append(agg_logits)
-
-                full_logits = torch.stack(full_logits, dim=0)  # Stack along first dimension
-                if save_sample_logits and output_path:
-                    # Create sample_logits directory if it doesn't exist
-                    sample_logits_dir = os.path.join(output_path, 'sample_logits')
-                    os.makedirs(sample_logits_dir, exist_ok=True)
-                    
-                    # Save the full logits tensor with rank and batch index in the filename
-                    logits_filename = os.path.join(sample_logits_dir, f'logits_{rank}_{batch_idx}.pt')
-                    
-                    # Save the logits and corresponding labels as a dictionary
-                    save_data = {
-                        'logits': full_logits.cpu(),
-                        'labels': batch['labels'].cpu(),
-                        'batch_idx': batch_idx,
-                        'rank': rank
-                    }
-                    
-                    # Also save patient IDs if available
-                    if patient_ids is not None:
-                        if isinstance(patient_ids, torch.Tensor):
-                            save_data['patient_ids'] = patient_ids.cpu()
-                        else:
-                            save_data['patient_ids'] = patient_ids
-                    
-                    torch.save(save_data, logits_filename)
-
-                if intermediate_agg == "mean":
-                    agg_logits = torch.mean(full_logits, dim=0)  # Mean along horizon dimension
-                else:
-                    agg_logits = torch.max(full_logits, dim=0).values  # Max along horizon dimension
-
-            # Collect scores and labels
-            batch_logits.append(agg_logits)
-            batch_labels.append(batch['labels'])
-            
-            # Periodically gather results across GPUs
-            if (batch_idx + 1) % n_gather == 0 or batch_idx == len(dataloader) - 1:
-                batch_logits_tensor = torch.cat(batch_logits)
-                batch_labels_tensor = torch.cat(batch_labels)
-                
-                # Synchronize before gathering
-                dist.barrier()
-                
-                # Gather results from all GPUs
-                gathered_logits = gather_variable_results(batch_logits_tensor, rank, world_size)
-                gathered_labels = gather_variable_results(batch_labels_tensor, rank, world_size)
-                
-                if rank == 0:
-                    if 'all_logits' not in locals():
-                        all_logits = gathered_logits.cpu().numpy()
-                        all_labels = gathered_labels.cpu().numpy()
-                    else:
-                        all_logits = np.concatenate([all_logits, gathered_logits.cpu().numpy()])
-                        all_labels = np.concatenate([all_labels, gathered_labels.cpu().numpy()])
-                
-                # Clear batch data
-                batch_logits = []
-                batch_labels = []
-                
-                # Clean up memory
-                del gathered_logits, gathered_labels, batch_logits_tensor, batch_labels_tensor
-                torch.cuda.empty_cache()
-    
-    # Final barrier to ensure all processes have finished
-    dist.barrier()
-    
-    # Compute metrics if requested (only on rank 0)
-    if compute_metrics and rank == 0:
-        metrics = {}
-        
-        # Apply threshold
-        predictions = (all_logits >= threshold).astype(int)
-        
-        # Calculate metrics
-        metrics['precision'] = precision_score(all_labels, predictions)
-        metrics['recall'] = recall_score(all_labels, predictions)
-        metrics['f1'] = f1_score(all_labels, predictions)
-        metrics['auroc'] = roc_auc_score(all_labels, all_logits)
-        metrics['auprc'] = average_precision_score(all_labels, all_logits)
-        
-        return all_labels, all_logits, metrics
-    
-    if rank == 0:
-        return all_labels, all_logits, None
-    else:
-        return None, None, None
 
 def plot_precision_recall_curve(val_labels, val_scores, test_labels, test_scores, 
-                                optimal_threshold, output_path):
+                                optimal_threshold, output_path, val_identifiers=None, test_identifiers=None):
     """
     Plot and save precision-recall curves for both validation and test sets.
     Also save the raw data for reproducing the plot.
@@ -289,11 +225,27 @@ def plot_precision_recall_curve(val_labels, val_scores, test_labels, test_scores
         optimal_threshold: Optimal threshold from validation set
         output_path: Directory to save the plot and data
     """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
     # Ensure arrays are 1-dimensional
     val_labels = np.ravel(val_labels)
     val_scores = np.ravel(val_scores)
     test_labels = np.ravel(test_labels)
     test_scores = np.ravel(test_scores)
+    saved_identifiers = {}
+    if (val_identifiers is None) != (test_identifiers is None):
+        raise ValueError('Provide identifiers for both validation and test splits')
+    for split, identifiers, labels in [('val', val_identifiers, val_labels),
+                                       ('test', test_identifiers, test_labels)]:
+        if identifiers is not None:
+            for field in ('patient_ids', 'record_ids'):
+                values = np.asarray(identifiers[field], dtype=str)
+                if values.ndim != 1 or len(values) != len(labels):
+                    raise ValueError(f'Misaligned {split}_{field}')
+                saved_identifiers[f'{split}_{field}'] = values
     
     # Compute precision-recall curves
     val_precision, val_recall, val_thresholds = precision_recall_curve(val_labels, val_scores)
@@ -368,14 +320,14 @@ def plot_precision_recall_curve(val_labels, val_scores, test_labels, test_scores
     val_df = pd.DataFrame({
         'precision': val_precision,
         'recall': val_recall,
-        'threshold': np.append(val_thresholds, [1.0]) if len(val_thresholds) > 0 else [1.0],
+        'threshold': np.append(val_thresholds, threshold_above_scores(val_scores)),
         'dataset': 'validation'
     })
     
     test_df = pd.DataFrame({
         'precision': test_precision,
         'recall': test_recall,
-        'threshold': np.append(test_thresholds, [1.0]) if len(test_thresholds) > 0 else [1.0],
+        'threshold': np.append(test_thresholds, threshold_above_scores(test_scores)),
         'dataset': 'test'
     })
     
@@ -388,192 +340,141 @@ def plot_precision_recall_curve(val_labels, val_scores, test_labels, test_scores
              val_scores=val_scores,
              val_labels=val_labels,
              test_scores=test_scores,
-             test_labels=test_labels)
+             test_labels=test_labels,
+             **saved_identifiers)
     
     print(f"Raw data saved to {os.path.join(output_path, 'precision_recall_data.json')} and related files")
     
-def load_latest_checkpoint(out_dir, device):
-    """
-    Load the latest checkpoint from the output directory.
-    
-    Args:
-        out_dir: Directory containing checkpoints
-        device: Device to load checkpoint to
-        
-    Returns:
-        checkpoint: Loaded checkpoint
-        checkpoint_model_args: Model arguments from checkpoint
-        config: Configuration dictionary
-    """
-    checkpoint_files = glob(os.path.join(out_dir, 'ckpt-*.pt'))
-    
-    with open(os.path.join(out_dir, 'config.json'), 'r') as f:
-        config = json.load(f)
-    
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoint files found in {out_dir}")
-    
-    checkpoint_files.sort(key=lambda x: int(x.split('-')[-1].split('.')[0]))
-    
-    latest_checkpoint = checkpoint_files[-1]
-    
-    print(f"Loading checkpoint: {latest_checkpoint}")
-    
-    checkpoint = torch.load(latest_checkpoint, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    
-    return checkpoint, checkpoint_model_args, config
+def load_latest_checkpoint(out_dir, device='cpu', iteration=None):
+    paths = glob(os.path.join(out_dir, 'ckpt-*.pt'))
+    if iteration is not None:
+        latest = Path(out_dir) / f'ckpt-{iteration}.pt'
+    else:
+        if not paths:
+            raise FileNotFoundError(f'No checkpoint files found in {out_dir}')
+        latest = Path(max(paths, key=lambda path: int(Path(path).stem.split('-')[-1])))
+    print(f'Loading checkpoint: {latest}', flush=True)
+    # Optimizer state stays off the GPU; mmap avoids eagerly reading its storage.
+    try:
+        checkpoint = torch.load(str(latest), map_location=device, mmap=True)
+    except RuntimeError as error:
+        if 'mmap' not in str(error):
+            raise
+        checkpoint = torch.load(str(latest), map_location=device)
+    config = checkpoint.get('config')
+    if config is None:
+        with open(Path(out_dir) / 'config.json') as handle:
+            config = json.load(handle)
+    return checkpoint, checkpoint['model_args'], config
+
+
+def make_dataloader(dataset, args, rank, world_size, device):
+    # DistributedSampler pads with repeated records. Strided shards include every
+    # record exactly once, even when there are fewer records than ranks.
+    shard = Subset(dataset, range(rank, len(dataset), world_size))
+    options = {'prefetch_factor': args.prefetch_factor} if args.num_workers else {}
+    return DataLoader(shard, batch_size=args.batch_size, num_workers=args.num_workers,
+                      pin_memory=device.type == 'cuda', **options)
+
 
 def main():
-    # Initialize distributed training
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    global_rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    
-    device = torch.device(f'cuda:{local_rank}')
-    torch.cuda.set_device(device)
-    
-    # Whether this is the main process
-    master_process = global_rank == 0
-    
-    print(f"Process {global_rank+1}/{world_size} starting on {device}")
-    
-    # Parse command line arguments
     args = parse_args()
-    
-    # Output directories setup
-    if args.approach=="direct":
-        output_path = os.path.join(args.out_dir, f"{args.condition_name}_evaluation_results_{args.time_horizon}_{args.approach}")
-    else:
-        output_path = os.path.join(args.out_dir, f"{args.condition_name}_evaluation_results_{args.time_horizon}_{args.approach}_intermdiate_horizon_{args.intermediate_horizon}_{args.intermediate_agg}")
-
-
-    if master_process:
+    rank = int(os.environ.get('RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}" if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    if world_size > 1:
+        dist.init_process_group(backend='nccl' if device.type == 'cuda' else 'gloo',
+                                timeout=timedelta(minutes=20))
+    master = rank == 0
+    torch.manual_seed(args.seed)
+    output_path = os.path.join(args.out_dir,
+                              f'{args.condition_name}_evaluation_results_{args.time_horizon}_{args.approach}')
+    if args.approach != 'direct':
+        output_path += f'_intermdiate_horizon_{args.intermediate_horizon}_{args.intermediate_agg}'
+    if args.score_space != 'probability':
+        output_path += f'_{args.score_space}'
+    if args.results_dir:
+        output_path = args.results_dir
+    if master:
         os.makedirs(output_path, exist_ok=True)
-        print(f"Output path: {output_path}")
-        # Create sample_logits directory within the output path
-        sample_logits_dir = os.path.join(output_path, 'sample_logits')
-        os.makedirs(sample_logits_dir, exist_ok=True)
-    
-    # Load condition indices
-    with open(args.condition_indices_path, "r") as f:
-        condition_indices = json.load(f)
-    
-    # Load model checkpoint
-    checkpoint, checkpoint_model_args, config = load_latest_checkpoint(args.out_dir, device)
-    print(f"Process {global_rank}: Latest checkpoint loaded successfully")
-    
-    # Create model
-    model_args = {}
-    for key in GPTCONFIG_PARAMS:
-        if key in checkpoint_model_args:
-            model_args[key] = checkpoint_model_args[key]
-    
+    with open(args.condition_indices_path) as handle:
+        condition_indices = json.load(handle)
+    checkpoint, saved_args, config = load_latest_checkpoint(args.out_dir, iteration=args.iteration)
+    model_args = {field.name: saved_args[field.name] for field in fields(GPTConfig) if field.name in saved_args}
+    if 'data_dir' not in model_args and saved_args.get('data_folder'):
+        model_args['data_dir'] = saved_args['data_folder']
+    if args.metadata_folder:
+        model_args['data_dir'] = args.metadata_folder
     gptconf = GPTConfig(**model_args)
+    if args.max_length > gptconf.block_size:
+        raise ValueError('max_length exceeds the checkpoint block size')
     model = GPT(gptconf)
-    
-    # Clean up state dict if needed (remove DDP-specific prefixes)
-    state_dict = checkpoint['model']
-    unwanted_prefix = '_orig_mod.'
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    
+    state_dict = {key.removeprefix('_orig_mod.'): value for key, value in checkpoint['model'].items()}
     model.load_state_dict(state_dict)
-    model.to(device)
-    
-    # Wrap model in DDP
-    model = DDP(model, device_ids=[local_rank])
-    model.eval()
-    
-    # Make sure all processes are ready
-    torch.cuda.synchronize(device)
-    dist.barrier()
-    print(f"Process {global_rank}: Model initialized and ready")
-    
-    # Prepare validation dataset and dataloader
-    print(f"Process {global_rank}: Loading validation dataset...")
-    val_dataset = SeqCLSDataset(mode="val", folder=args.data_path, multiwin=args.multiwin, time_horizon=args.time_horizon, num_patients = args.num_patients,approach = args.approach, horizon = args.intermediate_horizon)
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler, num_workers=8)
-    
-    # Evaluate on validation set to get scores for threshold calculation
-    print(f"Process {global_rank}: Evaluating on validation set...")
-    val_labels, val_scores, _ = evaluate_model_distributed(
-        model, val_dataloader, device, condition_indices, 
-        condition_name=args.condition_name, agg_method=args.agg_method, compute_metrics=False,
-        rank=global_rank, world_size=world_size, n_gather=args.n_gather, approach=args.approach,
-        intermediate_agg=args.intermediate_agg, save_sample_logits=True, output_path=output_path
-    )
-    
-    # Find optimal threshold on validation set (only on rank 0)
+    model.to(device).eval()
+    checkpoint_iteration = checkpoint.get('iter_num')
+    del state_dict, checkpoint
+    # No DDP wrapper: inference has no gradients or per-forward communication.
+    dataset_args = dict(folder=args.data_path, max_length=args.max_length, multiwin=args.multiwin,
+                        time_horizon=args.time_horizon, num_patients=args.num_patients,
+                        approach=args.approach, horizon=args.intermediate_horizon,
+                        metadata_folder=gptconf.data_dir, seed=args.seed, vocab_size=gptconf.vocab_size)
+    eval_args = dict(condition_name=args.condition_name, agg_method=args.agg_method,
+                     rank=rank, world_size=world_size, n_gather=args.n_gather, approach=args.approach,
+                     intermediate_agg=args.intermediate_agg, dtype=args.dtype, score_space=args.score_space)
+    start = time.perf_counter()
+    print(f'Process {rank}: Evaluating validation...', flush=True)
+    val_dataset = SeqCLSDataset(mode='val', **dataset_args)
+    val_count = len(val_dataset)
+    val_loader = make_dataloader(val_dataset, args, rank, world_size, device)
+    val_labels, val_scores, _, val_identifiers = evaluate_model_distributed(
+        model, val_loader, device, condition_indices, compute_metrics=False,
+        save_sample_logits=not args.skip_sample_logits, output_path=output_path,
+        return_identifiers=True, **eval_args)
+    val_dataset._cleanup()
+    del val_loader, val_dataset
+    # Threshold fitting and validation metrics use the scores already computed.
+    # Workers can immediately proceed to test inference without a broadcast.
     optimal_threshold = None
-    if master_process:
-        print("Finding optimal threshold...")
-        optimal_threshold = find_optimal_threshold(val_labels, val_scores, metric='f1')
-        print(f"Optimal threshold: {optimal_threshold:.4f}")
-    
-    # Broadcast optimal threshold to all processes
-    optimal_threshold = torch.tensor([optimal_threshold if optimal_threshold is not None else 0.0], device=device)
-    dist.broadcast(optimal_threshold, src=0)
-    optimal_threshold = optimal_threshold.item()
-    
-    # # Re-evaluate on validation set with optimal threshold
-    _, _, val_metrics = evaluate_model_distributed(
-        model, val_dataloader, device, condition_indices, 
-        condition_name=args.condition_name, agg_method=args.agg_method, threshold=optimal_threshold,
-        rank=global_rank, world_size=world_size, n_gather=args.n_gather, approach=args.approach,
-        intermediate_agg=args.intermediate_agg, save_sample_logits=False
-    )
-    
-    # Prepare test dataset and dataloader
-    print(f"Process {global_rank}: Loading test dataset...")
-    test_dataset = SeqCLSDataset(mode="test", folder=args.data_path, multiwin=args.multiwin, time_horizon=args.time_horizon, num_patients = args.num_patients ,approach = args.approach, horizon = args.intermediate_horizon)
-    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=global_rank, shuffle=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, sampler=test_sampler, num_workers=8)
-    
-    # Evaluate on test set with optimal threshold
-    print(f"Process {global_rank}: Evaluating on test set...")
-    test_labels, test_scores, test_metrics = evaluate_model_distributed(
-        model, test_dataloader, device, condition_indices, 
-        condition_name=args.condition_name, agg_method=args.agg_method, threshold=optimal_threshold,
-        rank=global_rank, world_size=world_size, n_gather=args.n_gather, approach=args.approach,
-        intermediate_agg=args.intermediate_agg, save_sample_logits=False
-    )
-    
-    # Plot and save precision-recall curves (only on rank 0)
-    if master_process:
-        print("Plotting precision-recall curves...")
-        plot_precision_recall_curve(
-            val_labels, val_scores, test_labels, test_scores,
-            optimal_threshold, output_path
-        )
-        
-        # Save metrics
-        metrics = {
-            'optimal_threshold': optimal_threshold,
-            'validation': val_metrics,
-            'test': test_metrics
-        }
-        
-        # Print metrics
-        print("\nValidation Metrics:")
-        for k, v in val_metrics.items():
-            print(f"  {k}: {v:.4f}")
-        
-        print("\nTest Metrics:")
-        for k, v in test_metrics.items():
-            print(f"  {k}: {v:.4f}")
-        
-        # Save metrics to JSON
-        with open(os.path.join(output_path, 'metrics.json'), 'w') as f:
-            json.dump(metrics, f, indent=4)
+    val_metrics = None
+    if master:
+        if len(val_scores) != val_count:
+            raise RuntimeError('Validation result count differs from the cohort size')
+        optimal_threshold = float(find_optimal_threshold(val_labels, val_scores))
+        val_metrics = classification_metrics(val_labels, val_scores, optimal_threshold)
+        print(f'Optimal threshold: {optimal_threshold:.6g}', flush=True)
+    print(f'Process {rank}: Evaluating test...', flush=True)
+    test_dataset = SeqCLSDataset(mode='test', **dataset_args)
+    test_count = len(test_dataset)
+    test_loader = make_dataloader(test_dataset, args, rank, world_size, device)
+    test_labels, test_scores, _, test_identifiers = evaluate_model_distributed(
+        model, test_loader, device, condition_indices, compute_metrics=False,
+        save_sample_logits=False, return_identifiers=True, **eval_args)
+    test_dataset._cleanup()
+    if master:
+        if len(test_scores) != test_count:
+            raise RuntimeError('Test result count differs from the cohort size')
+        test_metrics = classification_metrics(test_labels, test_scores, optimal_threshold)
+        plot_precision_recall_curve(val_labels, val_scores, test_labels, test_scores,
+                                    optimal_threshold, output_path, val_identifiers, test_identifiers)
+        metrics = {'optimal_threshold': optimal_threshold, 'score_space': args.score_space,
+                   'validation': val_metrics, 'test': test_metrics}
+        with open(os.path.join(output_path, 'metrics.json'), 'w') as handle:
+            json.dump(metrics, handle, indent=4)
+        report = dict(vars(args), checkpoint_iteration=checkpoint_iteration,
+                      metadata_folder=gptconf.data_dir, vocab_size=gptconf.vocab_size,
+                      world_size=world_size, validation_records=val_count, test_records=test_count,
+                      prediction_order='rank_concatenated', saved_patient_identifiers=True,
+                      elapsed_seconds=time.perf_counter() - start)
+        with open(os.path.join(output_path, 'evaluation_config.json'), 'w') as handle:
+            json.dump(report, handle, indent=2)
+        print(json.dumps(metrics, indent=2), flush=True)
+        print(f'Evaluation completed. Results saved to {output_path}', flush=True)
+    if world_size > 1:
+        dist.destroy_process_group()
 
-        print(f"\nEvaluation completed. Results saved to {output_path}")
-    
-    # Clean up
-    dist.destroy_process_group()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -43,13 +43,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Compute optimal thresholds and evaluate model.')
     parser.add_argument('--out_dir', type=str, default='./output', help='Output directory')
     parser.add_argument('--folder', type=str, default='./folder', help='Data directory')
+    parser.add_argument('--metadata_folder', help='Loss metadata folder; defaults to --folder')
     parser.add_argument('--csv_folder', type=str, default='./csv_folder', help='CSV path directory')
     parser.add_argument('--num_batches', type=int, default=512, help='Number of batches to process for threshold computation')
     parser.add_argument('--seed', type=int, default=1001, help='seed for test sampling')
     parser.add_argument('--test_patients', type=int, default=-1, help='Number of patients to test on')
     parser.add_argument('--n_gather', type=int, default=100, help='when to gather')
     parser.add_argument('--perc', type=int, default=90, help='Percentage for eval processing')
-    parser.add_argument('--mode', type=str, default='all', help='Evaluation mode: threshold, evaluate, or all')
+    parser.add_argument('--mode', choices=['train', 'val', 'test'], default='test', help='Patient split to evaluate')
     parser.add_argument('--opt_thresh_name', type=str, default='all', help='Evaluation mode: threshold, evaluate, or all')
     parser.add_argument('--agg_method', type=str, default='sum', choices=['sum', 'noisy_or','max','logsumexp','geometric_mean'])
     parser.add_argument('--threshold_method', type=str, default='f1', choices=['f1', 'quantile'],
@@ -220,6 +221,9 @@ def gather_variable_results(tensor, rank, world_size):
 @torch.no_grad()
 def process_batches_aggregated(model, loader, condition_indices, rank, device, bs, world_size, num_batches, n_gather=100, agg_method="sum"):
     model.eval()
+    num_batches = min(num_batches, len(loader))
+    if num_batches <= 0:
+        raise ValueError('Threshold fitting requires at least one validation batch per rank')
     all_logits = []
     all_labels = []
     
@@ -472,7 +476,8 @@ def evaluate_model(model, loader, condition_indices, opt_thresh, rank, device, b
                 sub_batch['labels'].float(),
                 sub_batch['pred_mask'],
                 sub_batch['pad_mask'],
-                sub_batch['attention_bias']
+                sub_batch['attention_bias'],
+                patient_ids=sub_batch.get('patient_ids'),
             )
             
             batch_results = evaluate_on_time_parallel(
@@ -878,11 +883,13 @@ def load_latest_checkpoint(out_dir, device, iteration = None):
     print(f"Loading checkpoint: {latest_checkpoint}")
     
     checkpoint = torch.load(latest_checkpoint, map_location=device)
+    config.update(checkpoint.get('config', {}))
     checkpoint_model_args = checkpoint['model_args']
     
     return checkpoint, checkpoint_model_args,config
 
 def main():
+    args = parse_args()
     dist.init_process_group(backend="nccl")
 
     
@@ -897,9 +904,6 @@ def main():
     master_process = ddp_rank == 0
 
 
-    args = parse_args()
-
-
     folder = args.folder
     batch_size = 8
     
@@ -911,9 +915,10 @@ def main():
 
     model_args = {} 
     full_args = checkpoint_model_args
-    keys_to_remove = [key for key in model_args if key not in GPTCONFIG_PARAMS]
     for key in GPTCONFIG_PARAMS:
-        model_args[key] =  full_args[key]
+        if key in full_args:
+            model_args[key] = full_args[key]
+    model_args['data_dir'] = args.metadata_folder or args.folder
 
 
     gptconf = GPTConfig(**model_args)
@@ -949,7 +954,7 @@ def main():
     AUROC, AUPRC = None, None
 
 
-    opt_thresh_path = f"{args.out_dir}/{opt_thresh_name}_{args.threshold_method}_all_condition_{args.all_conditions}_{args.iteration}.npy"
+    opt_thresh_path = f"{args.out_dir}/{opt_thresh_name}_{args.threshold_method}_{args.agg_method}_all_condition_{args.all_conditions}_{args.iteration}.npy"
     eval_inds = np.load(os.path.join(args.folder, "data_files", f"loss_mask_{args.perc}_perc.npy"))
     eval_inds = np.append([False], eval_inds)
 
@@ -962,7 +967,7 @@ def main():
         val_sampler = DistributedSampler(val_dataset, shuffle=False)
         val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, collate_fn=custom_collate, num_workers=8)
         
-        all_agg_logits, all_agg_labels = process_batches_aggregated(model, val_dataloader, condition_indices, local_rank, device, batch_size, world_size, args.num_batches//world_size, 100, args.agg_method)
+        all_agg_logits, all_agg_labels = process_batches_aggregated(model, val_dataloader, condition_indices, ddp_rank, device, batch_size, world_size, max(1, args.num_batches//world_size), args.n_gather, args.agg_method)
         
         if master_process:
             if args.threshold_method == 'f1':
@@ -993,8 +998,16 @@ def main():
 
             print("Aggregated thresholds computed and saved.")
 
-            AUROC = roc_auc_score(all_agg_labels, all_agg_logits, average=None)
-            AUPRC = average_precision_score(all_agg_labels, all_agg_logits, average=None)
+            AUROC = np.array([
+                roc_auc_score(all_agg_labels[:, i], all_agg_logits[:, i])
+                if len(np.unique(all_agg_labels[:, i])) == 2 else np.nan
+                for i in range(all_agg_labels.shape[1])
+            ])
+            AUPRC = np.array([
+                average_precision_score(all_agg_labels[:, i], all_agg_logits[:, i])
+                if np.any(all_agg_labels[:, i]) else np.nan
+                for i in range(all_agg_labels.shape[1])
+            ])
             print("AUROC and AUPRC computed.")
         dist.barrier()
         
@@ -1011,7 +1024,7 @@ def main():
     if args.test_patients !=-1:
         df = df.sample(n=args.test_patients,replace= False, random_state = args.seed).reset_index(drop=True)
     dataset = UnifiedSeqEHRDataset(df, max_length=model_args["block_size"], model='GPT', folder=folder, age=None, train=False,agg_labels=agg_labels, multiwin=multiwin)
-    sampler = DistributedSampler(dataset, shuffle = False)
+    sampler = DistributedSampler(dataset, shuffle=False)
 
     dataloader = DataLoader(dataset, batch_size=batch_size,
                         sampler=sampler, collate_fn=custom_collate, num_workers=8)
@@ -1115,6 +1128,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
 

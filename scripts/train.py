@@ -17,16 +17,17 @@ import math
 import pickle
 from contextlib import nullcontext
 import glob
+import hashlib
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, barrier
 
 from raven.model import GPTConfig, GPT
 from torch.utils.data import DataLoader
 import pandas as pd
 import json
-from raven.dataset import UnifiedSeqEHRDataset, custom_collate
+from raven.dataset import UnifiedSeqEHRDataset, custom_collate, compact_collate
 
 
 
@@ -36,10 +37,12 @@ os.environ['TORCH_USE_CUDA_DSA'] = '1'
 # default config values
 # I/O
 n_tokens = 42337
+out_dir = '' # empty selects the hyperparameter-based directory below
 
 eval_interval = 500 # how often to evaluate the validation set, in iterations
 log_interval = 1
-save_interval = 5000
+save_interval = 150000
+required_checkpoint_iter = 0 # optionally save this iteration outside the regular interval
 eval_iters = 8
 eval_only = False # if True, script exits right after the first eval
 init_from = 'scratch' # 'scratch' or 'resume'
@@ -49,6 +52,10 @@ wandb_project = 'GPT-EHR'
 wandb_run_name = 'raven'
 # data
 csv_folder = "./data/"
+loss_metadata_folder = '' # optional separate data_files/ snapshot
+loss_only = True # compact SEP labels and supervised-position output projection
+train_workers = 8
+loader_prefetch = 4
 
 gradient_accumulation_steps = 8 # used to simulate larger batch sizes
 
@@ -70,13 +77,13 @@ alpha = 0.995
 pos_weight = 1.0
 loss_type = "FL" # BCE or Focal Loss
 learning_rate = 2.2e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 610000 # total number of training microbatches
 weight_decay = 0.01
 beta1 = 0.9
 beta2 = 0.95
 agg_labels = False
 temporal_decay = 0.5
-multiwin = False
+multiwin = True
 data_subset = 1.0
 
 
@@ -84,7 +91,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 20000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 800000
 min_lr = 2.2e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # DDP settings
@@ -92,18 +99,25 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # optional; compact prediction counts can cause recompilation
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 from raven.configurator import apply_overrides
 apply_overrides(globals()) # overrides from command line or config file
+manifest_path = os.path.join(csv_folder, 'dataset_manifest.json')
+if os.path.isfile(manifest_path):
+    with open(manifest_path) as handle:
+        manifest = json.load(handle)
+    n_tokens = int(manifest['retained_width'])
+if required_checkpoint_iter > max_iters:
+    raise ValueError('required_checkpoint_iter exceeds max_iters')
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 if loss_type=="BCE":
-    out_dir = f"scaling_{data_subset}/out_multi_win_{multiwin}_{loss_weighting}_grad_clip_{grad_clip}_lr_{learning_rate}_min_lr_{min_lr}_top_perc_{perc}_n_layer_{n_layer}_n_head_{n_head}_n_embd_{n_embd}_rotary_embedding_{rotary}_use_xpos_{use_xpos}_max_iters_{max_iters}_agg_labels_{agg_labels}_reverse_temporal_decay_{temporal_decay}_block_size_{block_size}_data_{data_subset}"
+    out_dir = out_dir or f"scaling_{data_subset}/out_multi_win_{multiwin}_{loss_weighting}_grad_clip_{grad_clip}_lr_{learning_rate}_min_lr_{min_lr}_top_perc_{perc}_n_layer_{n_layer}_n_head_{n_head}_n_embd_{n_embd}_rotary_embedding_{rotary}_use_xpos_{use_xpos}_max_iters_{max_iters}_agg_labels_{agg_labels}_reverse_temporal_decay_{temporal_decay}_block_size_{block_size}_data_{data_subset}"
     wandb_run_name = wandb_run_name + f"_{loss_weighting}_grad_clip_{grad_clip}_lr_{learning_rate}_min_lr_{min_lr}_top_perc_{perc}_n_layer_{n_layer}_n_head_{n_head}_n_embd_{n_embd}_rotary_embedding_{rotary}_use_xpos_{use_xpos}_max_iters_{max_iters}_agg_labels_{agg_labels}_reverse_temporal_decay_{temporal_decay}_block_size_{block_size}_data_{data_subset}"
 else:
-    out_dir = f"scaling_{data_subset}/out_multi_win_{multiwin}_{loss_weighting}_grad_clip_{grad_clip}_lr_{learning_rate}_min_lr_{min_lr}_top_perc_{perc}_n_layer_{n_layer}_n_head_{n_head}_n_embd_{n_embd}_rotary_embedding_{rotary}_use_xpos_{use_xpos}_agg_labels_{agg_labels}_reverse_temporal_decay_{temporal_decay}_block_size_{block_size}_data_{data_subset}"
+    out_dir = out_dir or f"scaling_{data_subset}/out_multi_win_{multiwin}_{loss_weighting}_grad_clip_{grad_clip}_lr_{learning_rate}_min_lr_{min_lr}_top_perc_{perc}_n_layer_{n_layer}_n_head_{n_head}_n_embd_{n_embd}_rotary_embedding_{rotary}_use_xpos_{use_xpos}_agg_labels_{agg_labels}_reverse_temporal_decay_{temporal_decay}_block_size_{block_size}_data_{data_subset}"
     wandb_run_name = wandb_run_name + f"_{loss_weighting}_grad_clip_{grad_clip}_lr_{learning_rate}_min_lr_{min_lr}_top_perc_{perc}_n_layer_{n_layer}_n_head_{n_head}_n_embd_{n_embd}_rotary_embedding_{rotary}_use_xpos_{use_xpos}_agg_labels_{agg_labels}_reverse_temporal_decay_{temporal_decay}_block_size_{block_size}_data_{data_subset}"
 
 
@@ -135,8 +149,9 @@ if ddp:
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
+    if 'cuda' in device:
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank # each process gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
@@ -150,6 +165,7 @@ else:
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
+print(f"One iteration is one microbatch; {gradient_accumulation_steps} iterations per optimizer update")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -173,15 +189,22 @@ if data_subset<1.0:
 print("total training size:", train_df.shape[0])
 val_df = pd.read_csv(os.path.join(csv_folder, "csvs", "val.csv"))
 
-train_dataset = UnifiedSeqEHRDataset(train_df, max_length=block_size, model='GPT', folder = csv_folder, age=None, train = True, temporal_decay = temporal_decay, multiwin = multiwin)
-val_dataset = UnifiedSeqEHRDataset(val_df, max_length=block_size, model='GPT', folder = csv_folder, age=None, train = False, temporal_decay = None, multiwin = multiwin)
+train_dataset = UnifiedSeqEHRDataset(train_df, max_length=block_size, model='GPT', folder = csv_folder, age=None, train = True, temporal_decay = temporal_decay, multiwin = multiwin, compact_labels=loss_only)
+val_dataset = UnifiedSeqEHRDataset(val_df, max_length=block_size, model='GPT', folder = csv_folder, age=None, train = False, temporal_decay = None, multiwin = multiwin, compact_labels=loss_only)
 
-sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
-val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
+sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=ddp_world_size, rank=seed_offset, shuffle=True)
+val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=ddp_world_size, rank=seed_offset, shuffle=False)
 
 
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=8, pin_memory=True)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler, collate_fn=custom_collate)
+loader_options = dict(persistent_workers=True, prefetch_factor=loader_prefetch) if train_workers else {}
+collate_fn = compact_collate if loss_only else custom_collate
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler,
+                              num_workers=train_workers, pin_memory=(device_type == 'cuda'),
+                              collate_fn=collate_fn, **loader_options)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler,
+                            pin_memory=(device_type == 'cuda'), collate_fn=collate_fn)
+if not len(train_dataloader) or not len(val_dataloader):
+    raise ValueError('Training and validation splits must both contain patients')
 loaders = {"train":train_dataloader, "val":val_dataloader}
 
 
@@ -191,7 +214,7 @@ best_val_loss = 1e9
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, gamma = gamma,loss_type=loss_type, alpha=alpha, pos_weight = pos_weight, loss_weighting = loss_weighting, rotary = rotary, use_xpos = use_xpos, loss_top_perc= perc, data_dir=csv_folder) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, gamma = gamma,loss_type=loss_type, alpha=alpha, pos_weight = pos_weight, loss_weighting = loss_weighting, rotary = rotary, use_xpos = use_xpos, loss_top_perc= perc, data_dir=loss_metadata_folder or csv_folder) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -205,6 +228,9 @@ elif init_from == 'resume':
     # resume training from a checkpoint.
     checkpoint, checkpoint_model_args = load_latest_checkpoint(out_dir, device)
     print("Latest checkpoint loaded successfully")
+    if not loss_metadata_folder:
+        model_args['data_dir'] = checkpoint_model_args.get(
+            'data_dir', checkpoint_model_args.get('data_folder', csv_folder))
 
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
@@ -228,6 +254,16 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 
+if master_process:
+    loss_mask_path = os.path.join(model_args['data_dir'], 'data_files', f'loss_mask_{perc}_perc.npy')
+    with open(loss_mask_path, 'rb') as handle:
+        loss_mask_sha256 = hashlib.sha256(handle.read()).hexdigest()
+    loss_metadata = {'path': loss_mask_path, 'sha256': loss_mask_sha256,
+                     'active_outputs': int(model.num_outs.item())}
+    with open(os.path.join(out_dir, 'loss_metadata.json'), 'w') as handle:
+        json.dump(loss_metadata, handle, indent=2)
+    print('LOSS_METADATA ' + json.dumps(loss_metadata), flush=True)
+
 print(f"device : {device}")
 model.to(device)
 
@@ -248,7 +284,7 @@ if compile:
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank]) #,find_unused_parameters=True)
+    model = DDP(model, device_ids=[ddp_local_rank] if device_type == 'cuda' else None)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 def is_nan_or_inf(tensor):
@@ -266,7 +302,7 @@ def log_nan_info(name, tensor):
 def estimate_loss():
     out = {}
     
-    model.eval()
+    raw_model.eval()
     for split in ['val']:
 
         data = loaders[split]
@@ -274,12 +310,15 @@ def estimate_loss():
         losses = 0
         total = 0
         for batch in data:
-            token_arr, days_embed_arr, labels, pred_mask, pad_mask, attention_bias, patient_ids = batch["token_arr"], batch["days_embed_arr"],batch["labels"],batch["pred_mask"],batch["pad_mask"],batch["attention_bias"], batch['patient_ids']
-            token_arr,days_embed_arr,labels,pred_mask,pad_mask,attention_bias,patient_ids = token_arr.to(device),days_embed_arr.to(device),labels.to(device),pred_mask.to(device),pad_mask.to(device),attention_bias.to(device),patient_ids.to(device)
+            token_arr, days_embed_arr, labels, pred_mask, pad_mask, attention_bias = (
+                batch[key].to(device, non_blocking=True)
+                for key in ('token_arr', 'days_embed_arr', 'labels', 'pred_mask', 'pad_mask', 'attention_bias')
+            )
+            patient_ids = batch['patient_ids'].to(device, non_blocking=True) if 'patient_ids' in batch else None
             bs = token_arr.shape[0]
             total+=bs
             with ctx:
-                _, loss, _, _ = model(token_arr,days_embed_arr,labels,pred_mask,pad_mask,attention_bias,patient_ids=patient_ids)
+                _, loss, _, _ = raw_model(token_arr,days_embed_arr,labels,pred_mask,pad_mask,attention_bias,patient_ids=patient_ids,loss_only=loss_only)
             losses += loss.item() * bs
 
             k+=1
@@ -288,7 +327,7 @@ def estimate_loss():
         losses = losses/total
         out[split] = losses
 
-    model.train()
+    raw_model.train()
     return out
 
 def get_lr(it):
@@ -320,10 +359,15 @@ raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 all_losses = {"train":[], "val":[]}
 
-do_train = True
+do_train = iter_num < max_iters and not eval_only
 
 epoch = 0
 micro_step = 0
+if eval_only:
+    if master_process:
+        print(estimate_loss())
+    if ddp:
+        barrier()
 while do_train:
     sampler.set_epoch(epoch)
     for batch in loaders["train"]:
@@ -332,27 +376,26 @@ while do_train:
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        if iter_num == 0 and eval_only:
-            break
-
         token_arr, days_embed_arr, labels, pred_mask, pad_mask, attention_bias = (
-            batch["token_arr"].to(device), batch["days_embed_arr"].to(device),
-            batch["labels"].to(device), batch["pred_mask"].to(device),
-            batch["pad_mask"].to(device), batch["attention_bias"].to(device),
+            batch["token_arr"].to(device, non_blocking=True), batch["days_embed_arr"].to(device, non_blocking=True),
+            batch["labels"].to(device, non_blocking=True), batch["pred_mask"].to(device, non_blocking=True),
+            batch["pad_mask"].to(device, non_blocking=True), batch["attention_bias"].to(device, non_blocking=True),
         )
         temporal_weights = None
         patient_ids = None
         if 'temporal_weights' in batch and temporal_decay is not None:
-            temporal_weights = batch['temporal_weights'].to(device)
+            temporal_weights = batch['temporal_weights'].to(device, non_blocking=True)
         if 'patient_ids' in batch:
-            patient_ids = batch['patient_ids'].to(device)
+            patient_ids = batch['patient_ids'].to(device, non_blocking=True)
+        if temporal_decay is not None and temporal_weights is None:
+            raise RuntimeError('Temporal weighting is enabled but the dataset returned no weights')
 
         if ddp:
             # Only sync on last micro step of the macro step
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
 
         with ctx:
-            logits, loss, loss_components, _ = model(token_arr, days_embed_arr, labels, pred_mask, pad_mask, attention_bias, temporal_weights, patient_ids)
+            logits, loss, loss_components, _ = model(token_arr, days_embed_arr, labels, pred_mask, pad_mask, attention_bias, temporal_weights, patient_ids, loss_only=loss_only)
             loss = loss / gradient_accumulation_steps  # Scale the loss based on number of sub-batches
             
         # backward pass, with gradient scaling if training in fp16
@@ -372,12 +415,13 @@ while do_train:
             optimizer.zero_grad(set_to_none=True)
             micro_step = 0
 
-        # timing and logging
+        # Materialize loss before timing so logged CUDA work has completed.
+        should_log = iter_num % log_interval == 0 and master_process
+        lossf = loss.item() * gradient_accumulation_steps if should_log else None
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        if iter_num % log_interval == 0 and master_process:
-            lossf = loss.item() * gradient_accumulation_steps
+        if should_log:
 
             all_losses["train"].append(lossf)
 
@@ -390,34 +434,36 @@ while do_train:
                     "step_train/loss": lossf,
                     "batch_size": len(batch["token_arr"]),
                 }
-                log_data.update(loss_components)
+                log_data.update({key: value.item() if torch.is_tensor(value) else value
+                                 for key, value in loss_components.items()})
                 wandb.log(log_data)
 
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, batch_size {len(batch['token_arr'])}")
             if local_iter_num >= 5:  # let the training loop settle a bit
-                mfu = raw_model.estimate_mfu(len(batch["token_arr"]), dt)
+                positions = int(batch['pred_mask'].sum()) if loss_only else None
+                mfu = raw_model.estimate_mfu(len(batch["token_arr"]), dt, prediction_positions=positions)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
 
 
         # ——— run validation every eval_interval iters ———
-        if iter_num % eval_interval == 0 and master_process:
-            val_stats = estimate_loss()           # runs on eval_iters batches
-            val_loss = val_stats["val"]
-            all_losses["val"].append(val_loss)
-            print(f"iter {iter_num}: val loss {val_loss:.4f}")
-
-            if wandb_log:
-                log_data = {
-                    "iter": iter_num,
-                    "epoch": epoch,
-                    "step_val/loss": val_loss,
-                }
-                wandb.log(log_data)
+        if iter_num % eval_interval == 0:
+            if ddp:
+                barrier()
+            if master_process:
+                val_stats = estimate_loss()  # retains the rank-zero validation shard
+                val_loss = val_stats["val"]
+                all_losses["val"].append(val_loss)
+                best_val_loss = min(best_val_loss, val_loss)
+                print(f"iter {iter_num}: val loss {val_loss:.4f}")
+                if wandb_log:
+                    wandb.log({"iter": iter_num, "epoch": epoch, "step_val/loss": val_loss})
+            if ddp:
+                barrier()
 
 
         iter_num += 1
         local_iter_num += 1
-        if iter_num>0 and iter_num % save_interval == 0 and master_process:
+        if iter_num > 0 and (iter_num % save_interval == 0 or iter_num == required_checkpoint_iter) and master_process:
             print(f"saving checkpoint to {out_dir}")
             checkpoint = {
                 'model': raw_model.state_dict(),
@@ -427,7 +473,9 @@ while do_train:
                 'best_val_loss': best_val_loss,
                 'config': config,
             }
-            torch.save(checkpoint, os.path.join(out_dir, f'ckpt-{iter_num}.pt'))
+            checkpoint_path = os.path.join(out_dir, f'ckpt-{iter_num}.pt')
+            torch.save(checkpoint, checkpoint_path + '.tmp')
+            os.replace(checkpoint_path + '.tmp', checkpoint_path)
             checkpoint = None  # free memory
             with open(os.path.join(out_dir, 'loss_logs.pkl'), 'wb') as f:
                 pickle.dump(all_losses, f)
@@ -437,10 +485,16 @@ while do_train:
                 pickle.dump(all_losses, f)
 
         # termination conditions
-        if iter_num > max_iters:
+        if iter_num >= max_iters:
             do_train = False
             break
     epoch += 1
 
+# Release persistent workers before closing their shared read-only databases.
+if getattr(train_dataloader, '_iterator', None) is not None:
+    train_dataloader._iterator._shutdown_workers()
+train_dataset._cleanup()
+val_dataset._cleanup()
 if ddp:
+    barrier()
     destroy_process_group()

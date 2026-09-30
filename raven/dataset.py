@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import pandas as pd
 import shelve
 import numpy as np
@@ -11,7 +12,8 @@ from tqdm import tqdm
 
 def custom_collate(batch):
     # Flatten the batch
-    flattened_batch = [item for patient_items in batch for item in patient_items]
+    flattened_batch = [item for sample in batch
+                       for item in (sample if isinstance(sample, list) else [sample])]
     
     # If the flattened batch is empty, return an empty dict
     if len(flattened_batch) == 0:
@@ -56,24 +58,64 @@ MASK_ID = 3
 UNK_ID = 4
 EOW_ID = 5
 
+
+def compact_collate(batch):
+    """Concatenate supervised rows in the order of the stacked prediction mask."""
+    items = [item for sample in batch
+             for item in (sample if isinstance(sample, list) else [sample])]
+    if not items:
+        raise ValueError('Cannot collate a batch with no windows')
+    result = {}
+    for key in items[0]:
+        values = [item[key] for item in items]
+        if all(value is None for value in values):
+            continue
+        if key == 'patient_id':
+            result[key] = values
+        elif key in ('labels', 'temporal_weights'):
+            result[key] = torch.from_numpy(np.concatenate(values, axis=0))
+        else:
+            result[key] = torch.from_numpy(np.stack(values))
+    if result['labels'].shape[0] != int(result['pred_mask'].sum()):
+        raise ValueError('Compact labels do not match the prediction mask')
+    return result
+
+
 class UnifiedSeqEHRDataset(Dataset):
-    def __init__(self, df, max_length=512, model='BERT', folder="./data/", age=None, train=False, agg_labels=False, temporal_decay=None,multiwin=False):
+    def __init__(self, df, max_length=512, model='BERT', folder="./data/", age=None, train=False, agg_labels=False, temporal_decay=None,multiwin=False, compact_labels=False):
         self.df = df
         self.max_length = max_length
         self.folder = folder
+        manifest_path = os.path.join(folder, 'dataset_manifest.json')
+        manifest = {}
+        if os.path.isfile(manifest_path):
+            with open(manifest_path) as handle:
+                manifest = json.load(handle)
+        if manifest.get('version') == 5 and manifest.get('status') != 'complete':
+            raise RuntimeError(f'Dataset is still being built: {folder}')
         print("Open db files:")
-        self.db_dict = {part: shelve.open(self.folder+'/processed_part_'+str(part)+'.shelve') for part in tqdm(range(40))}
+        self.db_dict = {part: shelve.open(os.path.join(self.folder, f'processed_part_{part}.shelve'), flag='r') for part in tqdm(range(40))}
         self.age = age
         self.model = model
         self.train = train
         remove_inds = np.load(os.path.join(folder, "data_files", "delete_inds.npy"))
-        total_prev_tokens = 57735
+        total_prev_tokens = manifest.get('source_width', 57735)
         self.keep_mask = np.ones(total_prev_tokens, dtype=bool)
         self.keep_mask[remove_inds] = False
         self.agg_labels = agg_labels
         self.temporal_decay = temporal_decay
         self.multiwin = multiwin
+        self.compact_labels = compact_labels
         print("temporal decay: ", self.temporal_decay)
+
+    def _remove_random_rows_csr(self, a, percentage=0.1):
+        """Drop visits for augmentation, retaining at least two for prediction."""
+        if a.shape[0] <= 2 or percentage <= 0:
+            return a
+        keep = np.random.rand(a.shape[0]) >= percentage
+        if keep.sum() < 2:
+            keep[[0, -1]] = True
+        return a[keep]
     
     def _compute_temporal_weights(self, labels, decay_factor=0.5,min_weight = 0.1):
         n_t, n_classes = labels.shape
@@ -170,22 +212,26 @@ class UnifiedSeqEHRDataset(Dataset):
         item_days_embed_arr = item_days_embed_arr - item_days_embed_arr[0]
         item_att_days_embed_arr = item_att_days_embed_arr - item_att_days_embed_arr[0]
         
-        # Create labels
-        all_labels = a.toarray() != 0
-        if self.agg_labels:
-            all_labels = self._fix_labels(all_labels, days_data)
-                
         pred_mask = (item_token_arr == SEP_ID)
         pad_mask = np.ones_like(item_token_arr, dtype=bool)
         num_sep = np.sum(pred_mask)
-        
-        labels = np.zeros((len(item_token_arr), a.shape[1]))
-        labels[pred_mask] = all_labels[start_ind+1:start_ind+1+num_sep]
+
+        # Densify only the target visits; compact labels omit unsupervised tokens.
+        label_rows = num_sep if self.compact_labels else len(item_token_arr)
+        label_index = slice(None) if self.compact_labels else pred_mask
+        labels = np.zeros((label_rows, a.shape[1]), dtype=bool if self.compact_labels else float)
+        if self.agg_labels:
+            all_labels = self._fix_labels(a.toarray() != 0, days_data)
+            labels[label_index] = all_labels[start_ind+1:start_ind+1+num_sep]
+        else:
+            labels[label_index] = a[start_ind+1:start_ind+1+num_sep].toarray() != 0
         labels[:, column_to_delete] = False
-        labels = np.append(np.zeros((len(item_token_arr), 6)), labels, axis=1)
+        labels = np.append(np.zeros((label_rows, 6), dtype=labels.dtype), labels, axis=1)
 
         if self.temporal_decay is not None:
             temporal_weights = self._compute_temporal_weights(labels, self.temporal_decay)
+            if self.compact_labels:
+                temporal_weights = temporal_weights.astype(np.float32)
         else:
             temporal_weights = None
                 
@@ -224,12 +270,16 @@ class UnifiedSeqEHRDataset(Dataset):
         combined_dummy_days = np.zeros(self.max_length, dtype=np.int64)
         combined_pad_mask = np.zeros(self.max_length, dtype=bool)
         combined_pred_mask = np.zeros(self.max_length, dtype=bool)
-        combined_labels = np.zeros((self.max_length, windows[0]['labels'].shape[1]), dtype=bool)
+        combined_labels = (np.concatenate([w['labels'] for w in windows]).astype(bool, copy=False)
+                           if self.compact_labels else
+                           np.zeros((self.max_length, windows[0]['labels'].shape[1]), dtype=bool))
         patient_ids = np.zeros(self.max_length, dtype=np.int64)
 
         has_temporal_weights = all(w.get('temporal_weights') is not None for w in windows)
         if has_temporal_weights:
-            combined_temporal_weights = np.ones((self.max_length, windows[0]['labels'].shape[1]), dtype=np.float32)
+            combined_temporal_weights = (np.concatenate([w['temporal_weights'] for w in windows])
+                                         if self.compact_labels else
+                                         np.ones((self.max_length, windows[0]['labels'].shape[1]), dtype=np.float32))
         else:
             combined_temporal_weights = None
 
@@ -249,10 +299,11 @@ class UnifiedSeqEHRDataset(Dataset):
             combined_days[current_pos:current_pos + seq_len] = window['days_embed_arr'] 
             combined_pad_mask[current_pos:current_pos + seq_len] = window['pad_mask']
             combined_pred_mask[current_pos:current_pos + seq_len] = window['pred_mask']
-            combined_labels[current_pos:current_pos + seq_len] = window['labels']
+            if not self.compact_labels:
+                combined_labels[current_pos:current_pos + seq_len] = window['labels']
             patient_ids[current_pos:current_pos + seq_len] = i
 
-            if has_temporal_weights:
+            if has_temporal_weights and not self.compact_labels:
                 combined_temporal_weights[current_pos:current_pos + seq_len] = window['temporal_weights']
 
             
@@ -265,7 +316,7 @@ class UnifiedSeqEHRDataset(Dataset):
                 patient_ids[current_pos + seq_len] = i
                 
 
-                if has_temporal_weights:
+                if has_temporal_weights and not self.compact_labels:
                     combined_temporal_weights[current_pos + seq_len] = 1
 
                 current_pos += seq_len + 1
@@ -409,35 +460,40 @@ class UnifiedSeqEHRDataset(Dataset):
                 attention_bias = self._create_attention_matrix(item_att_days_embed_arr)
                 attention_bias = self._pad_matrix(attention_bias, self.max_length)
 
-                # Create labels
-                labels = np.zeros((pred_mask.shape[0], a.shape[1]))
+                # Labels follow SEP order, including when a long visit is truncated.
                 pred_inds = np.where(pred_mask)[0]
-                all_labels = a.toarray() != 0
+                label_rows = len(pred_inds) if self.compact_labels else pred_mask.shape[0]
+                label_index = slice(None) if self.compact_labels else pred_inds
+                labels = np.zeros((label_rows, a.shape[1]), dtype=bool if self.compact_labels else float)
                 if self.agg_labels:
-                    all_labels = self._fix_labels(all_labels,days_data)
-                
-                labels[pred_inds] = all_labels[current_start+1:current_end+1]
+                    all_labels = self._fix_labels(a.toarray() != 0, days_data)
+                    labels[label_index] = all_labels[current_start+1:current_start+1+len(pred_inds)]
+                    first_visit_row = all_labels[current_start]
+                else:
+                    sliced = a[current_start:current_start+1+len(pred_inds)].toarray() != 0
+                    labels[label_index] = sliced[1:]
+                    first_visit_row = sliced[0]
 
                 labels[:, column_to_delete] = False
-                labels = np.append(np.zeros((self.max_length, 6)), labels, axis=1).astype(bool)
+                labels = np.append(np.zeros((label_rows, 6), dtype=bool), labels, axis=1).astype(bool)
                 
 
                 if self.temporal_decay is not None:
                     temporal_weights = self._compute_temporal_weights(labels,self.temporal_decay)
-                    temporal_weights = temporal_weights.astype('float')
+                    temporal_weights = temporal_weights.astype(np.float32 if self.compact_labels else float)
                 else:
                     temporal_weights = None
 
                 item = {
                     'token_arr': item_token_arr,
                     'days_embed_arr': item_days_embed_arr,
-                    'labels': labels.astype('int'),
+                    'labels': labels if self.compact_labels else labels.astype('int'),
                     'pred_mask': pred_mask,
                     'pad_mask': pad_mask,
                     'attention_bias': attention_bias,
                     'temporal_weights': temporal_weights,
                     'patient_id': patient_id,
-                    'first_visit_labels': np.concatenate([np.zeros(6), all_labels[current_start]])
+                    'first_visit_labels': np.concatenate([np.zeros(6), first_visit_row])
                 }
 
                 if (not self.train) and self.multiwin:
@@ -492,4 +548,6 @@ class UnifiedSeqEHRDataset(Dataset):
         return len(self.df)
 
     def _cleanup(self):
-        del self.db_dict
+        for db in self.db_dict.values():
+            db.close()
+        self.db_dict.clear()
