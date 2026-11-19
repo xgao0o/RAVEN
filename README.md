@@ -4,6 +4,8 @@ RAVEN is a generative pretraining approach for sequential electronic health reco
 
 **Paper:** [arxiv.org/abs/2603.24562](https://arxiv.org/abs/2603.24562)
 
+**Model:** [huggingface.co/NYUMedML/RAVEN](https://huggingface.co/NYUMedML/RAVEN)
+
 ## Repository Structure
 
 ```
@@ -171,9 +173,9 @@ See [`baselines/README.md`](baselines/README.md) for instructions on running bas
 ## Citation
 
 ```bibtex
-@article{rajamohan2026raven,
+@article{gao2026raven,
   title={Scaling Recurrence-aware Foundation Models for Clinical Records via Next-Visit Prediction},
-  author={Rajamohan, Haresh Rengaraj and Gao, Xiang and Zhu, Weicheng and Huang, Shih-Lun and Chen, Long and Schulman, Gabe and Jin, Huizhen and Li, Shengduo and Wang, Yixuan and Yang, Huidi and others},
+  author={Gao, Xiang and Rajamohan, Haresh Rengaraj and Zhu, Weicheng and Huang, Shih-Lun and Chen, Long and Schulman, Gabe and Jin, Huizhen and Li, Shengduo and Wang, Yixuan and Yang, Huidi and others},
   journal={arXiv preprint arXiv:2603.24562},
   year={2026}
 }
